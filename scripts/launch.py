@@ -283,13 +283,23 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
     source = metadata.get('source')
     outcomes = {}
     if source == 'official-hongkong-ota':
-        from os4_defaults import apply_runtime
-        apply_runtime(config, managed=True)
+        try:
+            from os4_defaults import apply_runtime
+            apply_runtime(config, managed=True)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            reason = str(error).splitlines()[0][:240] if str(error) else type(error).__name__
+            print('Warning: phone runtime defaults deferred: ' + reason, flush=True)
+            outcomes['phone_runtime'] = {'state': 'deferred', 'error': reason}
     elif source == 'official-yingtian-ota':
-        from os4_pad import apply_runtime, align_window
-        apply_runtime(config, managed=True)
-        if rotate_window:
-            align_window(config)
+        try:
+            from os4_pad import apply_runtime, align_window
+            apply_runtime(config, managed=True)
+            if rotate_window:
+                align_window(config)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            reason = str(error).splitlines()[0][:240] if str(error) else type(error).__name__
+            print('Warning: Pad runtime defaults deferred: ' + reason, flush=True)
+            outcomes['pad_runtime'] = {'state': 'deferred', 'error': reason}
     if is_os4():
         try:
             migrate_boot_service_helpers(config)
@@ -421,9 +431,15 @@ def main():
             command += ['-cpu', args.cpu]
         if args.tb_size:
             command += ['-tb-size', str(args.tb_size)]
+    popen_kwargs = {}
+    if sys.platform == 'win32':
+        popen_kwargs['creationflags'] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)
+    else:
+        popen_kwargs['start_new_session'] = True
     with log.open('wb') as output:
         process = subprocess.Popen(command, env=launch_environment, stdout=output,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
+                                   stderr=subprocess.STDOUT, **popen_kwargs)
     print(f"Starting {config['name']} (PID {process.pid}). Log: {log}", flush=True)
     # The emulator stays running if setup fails; evidence and userdata are retained.
     initialize(config, bypass_oobe=args.skip_oobe, rotate_window=not args.headless,
