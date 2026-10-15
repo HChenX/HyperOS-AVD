@@ -358,6 +358,8 @@ def main():
                         help='Override the QEMU machine model on Windows')
     parser.add_argument('--cpu',
                         help='Override the QEMU CPU model on Windows')
+    parser.add_argument('--qemu-extra', action='append', default=[],
+                        help='Append raw QEMU arguments on Windows; repeat for each argument')
     parser.add_argument('--allow-snapshot-save', action='store_true',
                         help='Allow the emulator to save snapshots on exit')
     parser.add_argument('--snapshot', nargs='?', const='default_boot',
@@ -431,6 +433,8 @@ def main():
             command += ['-cpu', args.cpu]
         if args.tb_size:
             command += ['-tb-size', str(args.tb_size)]
+        if args.qemu_extra:
+            command += args.qemu_extra
     popen_kwargs = {}
     if sys.platform == 'win32':
         popen_kwargs['creationflags'] = (
