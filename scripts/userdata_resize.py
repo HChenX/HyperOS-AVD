@@ -1,7 +1,6 @@
 """Grow stopped Emulator userdata filesystems without replacing encrypted data."""
 from datetime import datetime, timezone
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -10,10 +9,12 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import uuid
 
 from common import tool
+from file_lock import flock, LOCK_EX, LOCK_NB
 
 DATA = 'userdata-qemu.img'
 LAYER_NAMES = (DATA, DATA + '.qcow2', 'encryptionkey.img', 'encryptionkey.img.qcow2')
@@ -57,14 +58,73 @@ class OfflineBackupRequiredError(OpaqueFilesystemError):
     """An otherwise eligible encrypted growth needs its complete offline backup."""
 
 
+def _is_modern_fsck(path):
+    try:
+        res = subprocess.run([str(path), '-V'], capture_output=True, text=True, timeout=3)
+        match = re.search(r'e2fsck\s+([0-9]+)\.([0-9]+)', res.stdout + res.stderr)
+        if match:
+            # Need at least e2fsck 1.45 for modern Android ext4 features (metadata_csum, 64bit, quota, etc.)
+            version = (int(match.group(1)), int(match.group(2)))
+            return version >= (1, 45)
+    except Exception:
+        pass
+    return False
+
+
+def _has_wsl_tool(name):
+    try:
+        res = subprocess.run(['wsl', 'which', name], capture_output=True, text=True, timeout=5)
+        return res.returncode == 0 and bool(res.stdout.strip())
+    except Exception:
+        return False
+
+
+def _to_wsl_path(path):
+    p = Path(path).resolve().as_posix()
+    try:
+        out = subprocess.check_output(['wsl', 'wslpath', '-a', '-u', p], text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+        if out:
+            return out
+    except Exception:
+        pass
+    if len(p) >= 2 and p[1] == ':':
+        return f'/mnt/{p[0].lower()}{p[2:]}'
+    return str(path)
+
+
 def check_dependencies(sdk):
     """Let installation entrypoints report missing offline tools before writes."""
-    qemu = Path(sdk) / 'emulator/qemu-img'
+    sdk_path = Path(sdk)
+    qemu_cand = sdk_path / 'emulator/qemu-img.exe' if sys.platform == 'win32' else sdk_path / 'emulator/qemu-img'
+    qemu = qemu_cand if qemu_cand.is_file() else (sdk_path / 'emulator/qemu-img')
     if not qemu.is_file():
         raise RuntimeError('Missing Android SDK emulator/qemu-img; install the SDK Emulator first.')
-    dependencies = {'qemu': str(qemu), 'fsck': tool('e2fsck', 'e2fsprogs'),
-                    'resizer': tool('resize2fs', 'e2fsprogs')}
-    if not (shutil.which('lsof') or Path('/usr/sbin/lsof').is_file()):
+    fsck = None
+    resizer = None
+    if sys.platform == 'win32':
+        try:
+            cand_fsck = tool('e2fsck', 'e2fsprogs')
+            if _is_modern_fsck(cand_fsck):
+                fsck = cand_fsck
+                resizer = tool('resize2fs', 'e2fsprogs')
+        except RuntimeError:
+            pass
+
+        if not fsck or not resizer:
+            if _has_wsl_tool('e2fsck') and _has_wsl_tool('resize2fs'):
+                fsck = 'wsl:e2fsck'
+                resizer = 'wsl:resize2fs'
+            elif not fsck:
+                raise RuntimeError(
+                    'Modern e2fsck and resize2fs are required to resize Android ext4 userdata. '
+                    'SDK bundled e2fsck is too old (1.42). Please ensure WSL is installed with e2fsprogs '
+                    'or put modern e2fsprogs (>= 1.45) in PATH.'
+                )
+    else:
+        fsck = tool('e2fsck', 'e2fsprogs')
+        resizer = tool('resize2fs', 'e2fsprogs')
+    dependencies = {'qemu': str(qemu), 'fsck': fsck, 'resizer': resizer}
+    if sys.platform != 'win32' and not (shutil.which('lsof') or Path('/usr/sbin/lsof').is_file()):
         raise RuntimeError('Missing lsof; install it before resizing userdata.')
     return dependencies
 
@@ -102,11 +162,19 @@ def _json(path, value):
 
 
 def _sync_directory(path):
+    if sys.platform == 'win32':
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _sync_file(path):
+    mode = 'r+b' if sys.platform == 'win32' else 'rb'
+    with open(path, mode) as stream:
+        os.fsync(stream.fileno())
 
 
 def assert_offline(avd):
@@ -118,24 +186,51 @@ def assert_offline(avd):
     executable = shutil.which('lsof')
     if executable is None and Path('/usr/sbin/lsof').is_file():
         executable = '/usr/sbin/lsof'
-    if executable is None:
-        raise RuntimeError('Missing lsof; cannot safely resize open userdata. Install lsof first.')
-    result = subprocess.run([executable, '-t', '--', *map(str, paths)], capture_output=True, text=True)
-    if result.returncode == 0 or result.stdout.strip():
-        raise RuntimeError('Close this AVD and every process holding its userdata before resizing. No files were changed.')
-    if result.returncode != 1:
-        raise RuntimeError('Could not check open userdata files with lsof; no resize was performed.')
+    if executable is not None:
+        result = subprocess.run([executable, '-t', '--', *map(str, paths)], capture_output=True, text=True)
+        if result.returncode == 0 or result.stdout.strip():
+            raise RuntimeError('Close this AVD and every process holding its userdata before resizing. No files were changed.')
+        if result.returncode != 1:
+            raise RuntimeError('Could not check open userdata files with lsof; no resize was performed.')
+        return
+    if sys.platform == 'win32':
+        for path in paths:
+            try:
+                with open(path, 'r+b'):
+                    pass
+            except PermissionError:
+                raise RuntimeError('Close this AVD and every process holding its userdata before resizing. No files were changed.')
+            except OSError:
+                pass
+        return
+    raise RuntimeError('Missing lsof; cannot safely resize open userdata. Install lsof first.')
 
 
 def _run(arguments, *, allowed=(0,), log=None):
-    result = subprocess.run(list(map(str, arguments)), capture_output=True)
+    cmd = list(arguments)
+    is_wsl = False
+    if sys.platform == 'win32' and isinstance(cmd[0], str) and cmd[0].startswith('wsl:'):
+        is_wsl = True
+        tool_name = cmd[0].split(':', 1)[1]
+        wsl_args = []
+        for arg in cmd[1:]:
+            arg_str = str(arg)
+            if not arg_str.startswith('-') and (':\\' in arg_str or ':/' in arg_str or Path(arg_str).exists()):
+                wsl_args.append(_to_wsl_path(arg_str))
+            else:
+                wsl_args.append(arg_str)
+        cmd = ['wsl', tool_name] + wsl_args
+    else:
+        cmd = list(map(str, arguments))
+    result = subprocess.run(cmd, capture_output=True)
     if log is not None:
         with log.open('ab') as stream:
-            stream.write(json.dumps(list(map(str, arguments))).encode() + b'\n')
+            stream.write(json.dumps(cmd).encode() + b'\n')
             stream.write(result.stdout + result.stderr + b'\n')
     if result.returncode not in allowed:
         detail = (result.stderr + result.stdout).decode(errors='replace').strip()[-1200:]
-        raise RuntimeError(f'Userdata resize failed ({Path(arguments[0]).name}, exit {result.returncode}): {detail}')
+        name = Path(arguments[0]).name if not is_wsl else arguments[0]
+        raise RuntimeError(f'Userdata resize failed ({name}, exit {result.returncode}): {detail}')
     return result.stdout
 
 
@@ -435,14 +530,12 @@ def _grow_opaque_capacity(qemu, avd, layers, wanted, folder):
         _run([qemu, 'compare', avd / names[1], staged / names[1]], log=log)
         _run([qemu, 'check', staged / names[1]], log=log)
         for name in names:
-            with (staged / name).open('rb') as stream:
-                os.fsync(stream.fileno())
+            _sync_file(staged / name)
         for name in layers:
             if name.startswith('encryptionkey'):
                 saved = pending / 'original' / name
                 shutil.copy2(avd / name, saved)
-                with saved.open('rb') as stream:
-                    os.fsync(stream.fileno())
+                _sync_file(saved)
         _sync_directory(staged)
         _sync_directory(pending / 'original')
         _chain_unchanged(qemu, avd, layers, before)
@@ -694,7 +787,7 @@ def _resize_userdata(sdk, avd, wanted, *, allow_guest=False, backup=None):
         return {'changed': False, 'filesystem_bytes': wanted, 'uuid': geometry['uuid']}
     dependencies = check_dependencies(sdk)
     fsck, resizer = dependencies['fsck'], dependencies['resizer']
-    allocated = sum((avd / name).stat().st_blocks * 512 for name in data_names)
+    allocated = sum((getattr((avd / name).stat(), 'st_blocks', 0) * 512 or (avd / name).stat().st_size) for name in data_names)
     if shutil.disk_usage(avd).free < allocated + wanted // 50 + 64 * 1024**2:
         raise RuntimeError('Insufficient free host storage for a staged filesystem resize; originals were preserved.')
     hashes = {name: digest(avd / name) for name in layers}
@@ -712,7 +805,10 @@ def _resize_userdata(sdk, avd, wanted, *, allow_guest=False, backup=None):
     log = pending / 'commands.log'
     try:
         staged = pending / 'staged' / DATA
-        _run([qemu, 'convert', '-O', 'raw', top, staged], log=log)
+        if layers[data_names[-1]]['format'] == 'raw':
+            shutil.copy2(top, staged)
+        else:
+            _run([qemu, 'convert', '-O', 'raw', top, staged], log=log)
         _run([qemu, 'compare', top, staged], log=log)
         if layers[data_names[-1]]['virtual-size'] < wanted:
             _run([qemu, 'resize', staged, wanted], log=log)
@@ -732,15 +828,13 @@ def _resize_userdata(sdk, avd, wanted, *, allow_guest=False, backup=None):
             _run([qemu, 'check', pending / 'staged' / (DATA + '.qcow2')], log=log)
             _run([qemu, 'compare', staged, pending / 'staged' / (DATA + '.qcow2')], log=log)
         for name in data_names:
-            with (pending / 'staged' / name).open('rb') as stream:
-                os.fsync(stream.fileno())
+            _sync_file(pending / 'staged' / name)
         # Preserve all key bytes and backing names; they are never resized.
         for name in layers:
             if name.startswith('encryptionkey'):
                 saved = pending / 'original' / name
                 shutil.copy2(avd / name, saved)
-                with saved.open('rb') as stream:
-                    os.fsync(stream.fileno())
+                _sync_file(saved)
         _sync_directory(pending / 'original')
         assert_offline(avd)
         if any(digest(avd / name) != checksum for name, checksum in hashes.items()):
@@ -790,7 +884,7 @@ def _resize_lock(avd):
         raise RuntimeError('Refused a foreign userdata resize lock.')
     with lock.open('a') as stream:
         try:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(stream, LOCK_EX | LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('Another userdata resize is working on this AVD.') from None
         yield avd

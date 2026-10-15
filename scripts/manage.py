@@ -3,7 +3,6 @@
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import os
@@ -21,14 +20,23 @@ import urllib.request
 
 import common
 import setup
+from file_lock import flock, LOCK_EX, LOCK_NB
 from https_transport import secure_urlopen
-from common import REPO_ROOT, avd_home, host_check, port_free, sdk_path, sha256
+from common import REPO_ROOT, avd_home, emulator_binary, emulator_env, host_check, port_free, sdk_path, sha256
 
 VERSION = '1.2.2'
 MODULE_UPGRADE_PREFLIGHT = 'phone-owned-module-guards-v1'
 FORWARD_UPGRADE_POLICY = 'same-family-forward-v1'
 REPOSITORY = 'NEORUAA/HyperOS-AVD'
-HOME = Path(os.environ.get('HYPEROS_AVD_HOME', Path.home() / 'HyperOS-AVD')).expanduser().resolve()
+
+def default_home():
+    if os.environ.get('HYPEROS_AVD_HOME'):
+        return Path(os.environ['HYPEROS_AVD_HOME']).expanduser().resolve()
+    if sys.platform == 'win32' and Path('D:/RuanJian/HyperOS-AVD').exists():
+        return Path('D:/RuanJian/HyperOS-AVD').resolve()
+    return (Path.home() / 'HyperOS-AVD').resolve()
+
+HOME = default_home()
 LANG = 'zh'
 
 
@@ -307,10 +315,19 @@ def idle(root, name, port):
     if (root / 'local/instances.json').is_file():
         for saved in json.loads((root / 'local/instances.json').read_text()).values():
             port_free(saved)
-    rows = subprocess.check_output(['ps', '-ax', '-o', 'command='], text=True)
+    if sys.platform == 'win32':
+        try:
+            rows = subprocess.check_output(
+                ['powershell.exe', '-NoProfile', '-Command',
+                 'Get-CimInstance Win32_Process | Select-Object -ExpandProperty CommandLine'],
+                text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            rows = ''
+    else:
+        rows = subprocess.check_output(['ps', '-ax', '-o', 'command='], text=True)
     import shlex
     for row in rows.splitlines():
-        if 'qemu-system-' not in row and '/emulator/emulator ' not in row:
+        if 'qemu-system-' not in row and 'emulator' not in row.lower():
             continue
         try:
             args = shlex.split(row)
@@ -333,7 +350,7 @@ def lock(root):
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / '.manager.lock').open('a') as stream:
         try:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(stream, LOCK_EX | LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('Another manager is working on this instance.') from None
         yield
@@ -343,9 +360,13 @@ def clone(source, target):
     """Use APFS clones where possible; copy across volumes as a fallback."""
     source, target = Path(source), Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(['cp', '-c', '-p', str(source), str(target)], capture_output=True)
-    if result.returncode:
-        shutil.copy2(source, target)
+    try:
+        result = subprocess.run(['cp', '-c', '-p', str(source), str(target)], capture_output=True)
+        if result.returncode == 0:
+            return target
+    except (FileNotFoundError, OSError):
+        pass
+    shutil.copy2(source, target)
     return target
 
 
@@ -447,10 +468,13 @@ def prepare_storage(root, name, port, sdk, gib, folder):
             raise RuntimeError('Storage repair firmware differs from the installed release: ' + relative)
     current = properties(avd / 'config.ini')
     config = {**saved, 'sdk': str(sdk), 'userdata_capacity_token': result['userdata_capacity_token']}
-    command = [str(sdk / 'emulator/emulator'), '-avd', name, '-sysdir', str(root / 'images'),
+    accel_mode = 'on' if sys.platform == 'darwin' else 'off'
+    command = [str(emulator_binary(sdk)), '-avd', name, '-sysdir', str(root / 'images'),
                '-port', str(port), '-no-window', '-no-snapshot-load', '-no-snapshot-save',
-               '-accel', 'on', '-gpu', 'host', '-memory', current.get('hw.ramSize', '4096'),
+               '-accel', accel_mode, '-gpu', 'host', '-memory', current.get('hw.ramSize', '4096'),
                '-cores', current.get('hw.cpu.ncore', '2'), '-crash-report-mode', 'never']
+    if sys.platform == 'win32':
+        command += ['-feature', '-WindowsHypervisorPlatform,-HVF,-KVM']
     from launch import vulkan_features
     from rear_display_config import runtime_options
     command += vulkan_features(manifest.get('build', {}))
@@ -461,7 +485,7 @@ def prepare_storage(root, name, port, sdk, gib, folder):
     process, validated_guest, record = None, False, None
     try:
         with log.open('wb') as output:
-            process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
+            process = subprocess.Popen(command, env=emulator_env(sdk), stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
@@ -727,10 +751,13 @@ def prepare_module_upgrade(root, old, new, name, port, sdk, folder):
     idle(root, name, port)
     config = {'sdk': str(sdk), 'name': name, 'port': port}
     current = properties(root / 'avd' / (name + '.avd') / 'config.ini')
-    command = [str(sdk / 'emulator/emulator'), '-avd', name, '-sysdir', str(root / 'images'),
+    accel_mode = 'on' if sys.platform == 'darwin' else 'off'
+    command = [str(emulator_binary(sdk)), '-avd', name, '-sysdir', str(root / 'images'),
                '-port', str(port), '-no-window', '-no-snapshot-load', '-no-snapshot-save',
-               '-accel', 'on', '-gpu', 'host', '-memory', current.get('hw.ramSize', '6144'),
+               '-accel', accel_mode, '-gpu', 'host', '-memory', current.get('hw.ramSize', '6144'),
                '-cores', current.get('hw.cpu.ncore', '4'), '-crash-report-mode', 'never']
+    if sys.platform == 'win32':
+        command += ['-feature', '-WindowsHypervisorPlatform,-HVF,-KVM']
     say('正在启动升级前镜像，隔离旧补丁；完整用户数据备份已保存。',
         'Starting the previous firmware to gate old patches; full userdata backup is saved.')
     log = folder / 'module-upgrade-emulator.log'
@@ -738,7 +765,7 @@ def prepare_module_upgrade(root, old, new, name, port, sdk, folder):
     validated_guest = False
     try:
         with log.open('wb') as output:
-            process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            process = subprocess.Popen(command, env=emulator_env(sdk), stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -811,8 +838,14 @@ def point(root, target):
             legacy.mkdir(parents=True)
             path.rename(legacy / name)
         temporary = path.with_name(name + '.next')
-        temporary.unlink(missing_ok=True)
-        temporary.symlink_to(os.path.relpath(target / name, root), target_is_directory=True)
+        rel_target = os.path.relpath(target / name, root)
+        temporary.symlink_to(rel_target, target_is_directory=True)
+        if path.is_symlink() or (sys.platform == 'win32' and path.exists()):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                if path.is_dir():
+                    shutil.rmtree(path)
         temporary.replace(path)
 
 
@@ -827,8 +860,22 @@ state = json.loads((root / 'local/manager.json').read_text())
 os.environ['HYPEROS_AVD_WORKSPACE'] = str(root)
 raise SystemExit(subprocess.call([sys.executable, str(root / state['runtime'] / 'scripts/launch.py')], env=os.environ))
 PYTHON
-''')
+''', encoding='utf-8')
     file.chmod(0o755)
+    if sys.platform == 'win32':
+        cmd_file = root / 'Start.cmd'
+        cmd_code = (
+            '@echo off\r\nsetlocal\r\nset "PYTHONUTF8=1"\r\nchcp 65001 >nul\r\ncd /d "%~dp0"\r\n'
+            'set "HYPEROS_AVD_WORKSPACE=%~dp0"\r\n'
+            'python -c "import json, os, pathlib, subprocess, sys; '
+            'root = pathlib.Path(os.environ[\'HYPEROS_AVD_WORKSPACE\']).resolve(); '
+            'state = json.loads((root / \'local/manager.json\').read_text(encoding=\'utf-8\')); '
+            'runtime = root / \'local/runtime\' if (root / \'local/runtime/scripts/launch.py\').is_file() else root / state[\'runtime\']; '
+            'os.environ[\'HYPEROS_AVD_WORKSPACE\'] = str(root); '
+            'raise SystemExit(subprocess.call([sys.executable, str(runtime / \'scripts/launch.py\')] + sys.argv[1:], env=os.environ))" %*\r\n'
+            'endlocal\r\n'
+        )
+        cmd_file.write_text(cmd_code, encoding='utf-8')
 
 
 def restore(root, folder):
@@ -928,8 +975,15 @@ def switch(root, target, manifest, name, port, sdk, options, folder, camera=Fals
             clone(root / 'images/userdata.img', userdata)
             resize(sdk, data, capacity)
         runtime = target / 'runtime' if (target / 'runtime/scripts/launch.py').is_file() else REPO_ROOT
+        if sys.platform == 'win32':
+            runtime_dir = root / 'local/runtime'
+            for sub in ('scripts', 'config'):
+                dest = runtime_dir / sub
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(REPO_ROOT / sub, dest)
         json_write(root / 'local/manager.json', {'schema': 1, 'version': manifest['version'],
-            'runtime': os.path.relpath(runtime, root), 'backup': str(folder)})
+            'runtime': os.path.relpath(runtime, root).replace('\\', '/'), 'backup': str(folder)})
         wrapper(root)
         (root / 'local/upgrade-pending.json').unlink()
     except BaseException:
@@ -1016,6 +1070,8 @@ def start(instance, headless=False, skip_oobe=False):
     root = instance['root']
     state = root / 'local/manager.json'
     runtime = root / json.loads(state.read_text())['runtime'] if state.is_file() else REPO_ROOT
+    if sys.platform == 'win32' and (root / 'local/runtime/scripts/launch.py').is_file():
+        runtime = root / 'local/runtime'
     env = dict(os.environ, HYPEROS_AVD_WORKSPACE=str(root))
     command = [sys.executable, str(runtime / 'scripts/launch.py')]
     if headless:

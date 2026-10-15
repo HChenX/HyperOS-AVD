@@ -95,6 +95,7 @@ os.execvp(command,[command]+args)
 '''
 
 
+@unittest.skipIf(sys.platform == 'win32', 'Android shell runtime fixture requires POSIX host environment')
 class AppBridgeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

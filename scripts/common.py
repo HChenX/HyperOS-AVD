@@ -7,7 +7,9 @@ import platform
 import shutil
 import socket
 import subprocess
+import sys
 import urllib.request
+import file_lock
 from https_transport import secure_urlretrieve
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -36,38 +38,109 @@ def sha256(path):
 
 
 def host_check():
-    if platform.system() != 'Darwin' or platform.machine() != 'arm64':
-        raise RuntimeError('This release supports Apple Silicon macOS only.')
+    sys_name = platform.system()
+    machine = platform.machine().lower()
+    if sys_name == 'Darwin' and machine in ('arm64', 'aarch64'):
+        return
+    if sys_name == 'Windows' and machine in ('amd64', 'x86_64'):
+        return
+    raise RuntimeError(
+        f'Unsupported platform: {platform.system()} {platform.machine()}. '
+        'This release supports Apple Silicon macOS and Windows 11 x64.')
+
+
+def emulator_binary(sdk=None):
+    path = Path(sdk or sdk_path())
+    if sys.platform == 'win32':
+        qemu_arm64 = path / 'emulator/qemu/windows-x86_64/qemu-system-aarch64.exe'
+        if qemu_arm64.is_file():
+            return qemu_arm64
+        candidate = path / 'emulator/emulator.exe'
+        return candidate if candidate.is_file() else (path / 'emulator/emulator')
+    candidate = path / 'emulator/emulator'
+    return candidate if candidate.is_file() else (path / 'emulator/emulator.exe')
+
+
+def emulator_env(sdk=None, base_env=None):
+    env = dict(os.environ if base_env is None else base_env)
+    if sys.platform == 'win32':
+        sdk_emu = Path(sdk or sdk_path()) / 'emulator'
+        extra_paths = [
+            str(sdk_emu),
+            str(sdk_emu / 'lib64'),
+            str(sdk_emu / 'lib64/qt/lib'),
+            str(sdk_emu / 'lib64/gles_swiftshader'),
+            str(sdk_emu / 'lib64/vulkan'),
+            str(sdk_emu / 'qemu/windows-x86_64'),
+        ]
+        existing = env.get('PATH', '')
+        env['PATH'] = ';'.join(extra_paths) + (';' + existing if existing else '')
+        env['QT_QPA_PLATFORM_PLUGIN_PATH'] = str(sdk_emu / 'lib64/qt/plugins')
+        env['QT_PLUGIN_PATH'] = str(sdk_emu / 'lib64/qt/plugins')
+    return env
+
+
+def adb_binary(sdk=None):
+    path = Path(sdk or sdk_path())
+    candidate = path / 'platform-tools/adb.exe'
+    return candidate if candidate.is_file() else (path / 'platform-tools/adb')
 
 
 def sdk_path(explicit=None):
-    candidates = [explicit, os.environ.get('ANDROID_SDK_ROOT'), os.environ.get('ANDROID_HOME'),
-                  Path.home() / 'Library/Android/sdk']
+    candidates = [
+        explicit,
+        os.environ.get('ANDROID_SDK_ROOT'),
+        os.environ.get('ANDROID_HOME'),
+        Path(os.environ.get('LOCALAPPDATA', '')) / 'Android/Sdk' if sys.platform == 'win32' else None,
+        Path.home() / 'Library/Android/sdk' if sys.platform == 'darwin' else None,
+    ]
     for candidate in candidates:
         if candidate:
             path = Path(candidate).expanduser().resolve()
-            if (path / 'emulator/emulator').is_file() and (path / 'platform-tools/adb').is_file():
+            has_emulator = (path / 'emulator/emulator').is_file() or (path / 'emulator/emulator.exe').is_file()
+            has_adb = (path / 'platform-tools/adb').is_file() or (path / 'platform-tools/adb.exe').is_file()
+            if has_emulator and has_adb:
                 return path
-    raise RuntimeError('Install Android Studio Emulator and Platform-Tools, or set ANDROID_SDK_ROOT.')
+    raise RuntimeError('Install Android Studio Emulator and Platform-Tools, or set ANDROID_HOME / ANDROID_SDK_ROOT.')
 
 
 def avd_home():
     if os.environ.get('ANDROID_AVD_HOME'):
-        return Path(os.environ['ANDROID_AVD_HOME']).expanduser()
-    return Path(os.environ.get('ANDROID_EMULATOR_HOME', os.environ.get('ANDROID_USER_HOME',
-                str(Path.home() / '.android')))).expanduser() / 'avd'
+        return Path(os.environ['ANDROID_AVD_HOME']).expanduser().resolve()
+    if os.environ.get('ANDROID_EMULATOR_HOME'):
+        return (Path(os.environ['ANDROID_EMULATOR_HOME']).expanduser() / 'avd').resolve()
+    if os.environ.get('ANDROID_SDK_HOME'):
+        sdk_home = Path(os.environ['ANDROID_SDK_HOME']).expanduser().resolve()
+        if (sdk_home / '.android/avd').is_dir():
+            return sdk_home / '.android/avd'
+        if (sdk_home / 'avd').is_dir():
+            return sdk_home / 'avd'
+        return sdk_home / '.android/avd'
+    if os.environ.get('ANDROID_USER_HOME'):
+        return (Path(os.environ['ANDROID_USER_HOME']).expanduser() / 'avd').resolve()
+    return (Path.home() / '.android/avd').resolve()
 
 
 def tool(name, formula):
     found = shutil.which(name)
     if found:
         return found
+    if sys.platform == 'win32':
+        exe_name = name if name.endswith('.exe') else (name + '.exe')
+        try:
+            sdk = sdk_path()
+            for sub in ('emulator/bin64', 'platform-tools', 'emulator'):
+                candidate = sdk / sub / exe_name
+                if candidate.is_file():
+                    return str(candidate)
+        except RuntimeError:
+            pass
     for prefix in (Path('/opt/homebrew'), Path('/usr/local')):
         for directory in ('bin', 'sbin'):
             path = prefix / 'opt' / formula / directory / name
             if path.is_file():
                 return str(path)
-    raise RuntimeError(f'Missing {name}. Install it with: brew install {formula}')
+    raise RuntimeError(f'Missing {name}. Install it or make it available in PATH / Android SDK.')
 
 
 def port_free(port):
@@ -122,5 +195,5 @@ def runtime():
 
 def adb(config, *arguments, **kwargs):
     # There is deliberately no global server reset or implicit device selection.
-    return subprocess.run([str(Path(config['sdk']) / 'platform-tools/adb'),
+    return subprocess.run([str(adb_binary(config['sdk'])),
                            '-s', f"emulator-{config['port']}", *arguments], **kwargs)

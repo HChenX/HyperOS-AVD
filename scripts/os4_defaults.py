@@ -52,13 +52,13 @@ for node in /sys/devices/virtual/thermal/thermal_zone0/type /sys/devices/virtual
 done
 '''
 CONFIG = Path(__file__).resolve().parent.parent / 'config'
-LOG_SCRIPT = (CONFIG / 'kill_HyperOS_Log.sh').read_bytes()
+LOG_SCRIPT = (CONFIG / 'kill_HyperOS_Log.sh').read_bytes().replace(b'\r\n', b'\n')
 LOG_TAGS = tuple(LOG_SCRIPT.split(b'tags=(\n', 1)[1].split(b'\n)', 1)[0].decode().split())
 if not LOG_TAGS or len(set(LOG_TAGS)) != len(LOG_TAGS) or any(
         not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', tag) for tag in LOG_TAGS):
     raise RuntimeError('Invalid HyperOS log tag list.')
-REFRESH_SCRIPT = (CONFIG / 'lock_fps.sh').read_bytes()
-REFRESH_INIT = b'\n' + (CONFIG / 'lock_refresh_rate.rc').read_bytes()
+REFRESH_SCRIPT = (CONFIG / 'lock_fps.sh').read_bytes().replace(b'\r\n', b'\n')
+REFRESH_INIT = b'\n' + (CONFIG / 'lock_refresh_rate.rc').read_bytes().replace(b'\r\n', b'\n')
 REFRESH_SERVICE = '/data/adb/service.d/hyperos-avd-lock-fps.sh'
 REFRESH_WRAPPER = b'''#!/system/bin/sh
 # HyperOS-AVD refresh service v1; remove this file to disable the runtime override.

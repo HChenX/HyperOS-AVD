@@ -181,9 +181,9 @@ class OS4DefaultsTests(unittest.TestCase):
                 if command == 'pm disable --user 0 ' + COMPONENT:
                     return 'Component ' + COMPONENT + ' new state: disabled'
                 if AWAKE_SCRIPT in command:
-                    subprocess.run(['sh', '-e'], input=command.replace(AWAKE_STAMP, str(stamp)),
+                    subprocess.run(['sh', '-e'], input=command.replace(AWAKE_STAMP, stamp.as_posix()),
                         text=True, check=True, env=dict(os.environ,
-                            PATH=str(folder) + ':' + os.environ['PATH'], TEST_EVENTS=str(events)))
+                            PATH=str(folder) + os.pathsep + os.environ['PATH'], TEST_EVENTS=str(events)))
                 return ''
             with patch.object(common, 'ROOT', folder), patch('apply_flutter_fix.official'), \
                     patch('phone_profile.profile_from_build', return_value=selected), \
@@ -227,8 +227,8 @@ class OS4DefaultsTests(unittest.TestCase):
             settings = folder / 'settings'
             settings.write_text('#!/bin/sh\necho "$*" >> "$TEST_EVENTS"\n')
             settings.chmod(0o755)
-            env = dict(os.environ, PATH=str(folder) + ':' + os.environ['PATH'], TEST_EVENTS=str(events))
-            script = AWAKE_SCRIPT.replace(AWAKE_STAMP, str(stamp))
+            env = dict(os.environ, PATH=str(folder) + os.pathsep + os.environ['PATH'], TEST_EVENTS=str(events))
+            script = AWAKE_SCRIPT.replace(AWAKE_STAMP, stamp.as_posix())
             subprocess.run(['sh', '-e'], input=script, text=True, env=env, check=True)
             self.assertEqual(events.read_text().splitlines(), [
                 f'put system screen_off_timeout {SCREEN_TIMEOUT}',
@@ -386,7 +386,7 @@ esac''',
             script = folder / 'refresh.sh'
             script.write_bytes(REFRESH_SCRIPT)
             events = folder / 'events'
-            env = dict(os.environ, PATH=str(folder) + ':' + os.environ['PATH'],
+            env = dict(os.environ, PATH=str(folder) + os.pathsep + os.environ['PATH'],
                        TEST_HARDWARE='ranchu', TEST_EVENTS=str(events),
                        TEST_PARCEL='Result: Parcel(NULL)')
             result = subprocess.run(['sh', str(script)], env=env, capture_output=True)

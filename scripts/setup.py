@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import sys
 import tarfile
 import tempfile
 import urllib.parse
@@ -62,8 +63,9 @@ def read_manifest(value):
         raise RuntimeError('Invalid release version.')
     if manifest['version'].startswith('pad-') and manifest.get('variant') != PAD_VARIANT:
         raise RuntimeError('Invalid official OS4 Pad profile: version namespace requires the Pad firmware variant.')
-    if manifest.get('platform') != 'macos-arm64':
-        raise RuntimeError('This installer supports macos-arm64 releases only.')
+    SUPPORTED_PLATFORMS = ('macos-arm64', 'arm64', 'windows-x64', 'all', 'neutral')
+    if manifest.get('platform') not in SUPPORTED_PLATFORMS:
+        raise RuntimeError(f"Unsupported release platform '{manifest.get('platform')}'.")
     if manifest.get('format') in (2, 3):
         build = manifest.get('build', {})
         source = release_source(manifest)
@@ -217,7 +219,9 @@ def start_instruction(root):
     """Select a launcher by its firmware workspace, independent of AVD names."""
     root = Path(root).resolve()
     profile = workspace_profile(root)
-    if (root / 'Start.command').is_file():
+    if (root / 'Start.cmd').is_file():
+        start = root / 'Start.cmd'
+    elif (root / 'Start.command').is_file():
         start = root / 'Start.command'
     elif profile == OS4_SOURCE and root == REPO_ROOT / 'work/os4-official':
         start = REPO_ROOT / 'Start-HyperOS4-Official.command'
@@ -226,10 +230,12 @@ def start_instruction(root):
     elif root == REPO_ROOT and profile in (None, 'os3'):
         start = REPO_ROOT / 'Start-HyperOS.command'
     else:
+        py = 'python' if sys.platform == 'win32' else 'python3'
         command = ('HYPEROS_AVD_WORKSPACE=' + shlex.quote(str(root)) +
-                   ' python3 ' + shlex.quote(str(REPO_ROOT / 'scripts/launch.py')))
+                   f' {py} ' + shlex.quote(str(REPO_ROOT / 'scripts/launch.py')))
         return 'Run ' + command + ' to boot and complete first-start setup.'
-    return 'Double-click ' + str(start) + ' to boot and complete first-start setup.'
+    action = 'Run ' if sys.platform == 'win32' and str(start).endswith('.cmd') else 'Double-click '
+    return action + str(start) + ' to boot and complete first-start setup.'
 
 
 def install_bundle(value):
@@ -347,13 +353,16 @@ def configure(sdk, name, port):
         properties[key] = str(value)
     validate_memory(properties)
     template = ''.join(key + '=' + value + '\n' for key, value in properties.items())
-    template += f'image.sysdir.1={ROOT / "images"}/\n'
+    sysdir = str((ROOT / "images").resolve())
+    if not sysdir.endswith(os.sep):
+        sysdir += os.sep
+    template += f'image.sysdir.1={sysdir}\n'
     template += 'AvdId=' + name + '\navd.ini.displayname=' + name + '\n'
 
     path.mkdir(parents=True, exist_ok=True)
-    (path / 'config.ini').write_text(template)
+    (path / 'config.ini').write_text(template, encoding='utf-8')
     registry.parent.mkdir(parents=True, exist_ok=True)
-    registry.write_text(f'avd.ini.encoding=UTF-8\npath={path}\ntarget={target}\n')
+    registry.write_text(f'avd.ini.encoding=UTF-8\npath={path}\ntarget={target}\n', encoding='utf-8')
     (ROOT / 'local').mkdir(exist_ok=True)
     (ROOT / 'local/runtime.json').write_text(json.dumps(
         {**previous, 'sdk': str(sdk), 'name': name, 'port': port, 'hardware': hardware}, indent=2) + '\n')

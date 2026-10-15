@@ -168,6 +168,7 @@ class LegacyFlutterReceiptTests(unittest.TestCase):
             self.assets(value)
 
 
+@unittest.skipIf(sys.platform == 'win32', 'Android shell runtime fixture requires POSIX host environment')
 class CorePlatformShellTests(unittest.TestCase):
     setUp = fixture.NativeModuleRuntimeTests.setUp
     profile = fixture.NativeModuleRuntimeTests.profile

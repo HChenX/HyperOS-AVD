@@ -13,8 +13,14 @@ from init_userdata import create as create_userdata
 from patch_gnss import patch as patch_gnss
 
 BASE = sdk_path() / 'system-images/android-36/google_apis_playstore/arm64-v8a'
-DEBUGFS = tool('debugfs', 'e2fsprogs')
-DUMP_EROFS = tool('dump.erofs', 'erofs-utils')
+try:
+    DEBUGFS = tool('debugfs', 'e2fsprogs')
+except RuntimeError:
+    DEBUGFS = None
+try:
+    DUMP_EROFS = tool('dump.erofs', 'erofs-utils')
+except RuntimeError:
+    DUMP_EROFS = None
 KSU_TOOL = ROOT / 'tools/ksud-aarch64-apple-darwin'
 KSU_MODULE = ROOT / 'tools/lkm-aarch64-android15-6.6_kernelsu.ko'
 KSU_HASHES = {
@@ -24,6 +30,8 @@ KSU_HASHES = {
 
 
 def erofs(image, path):
+    if not DUMP_EROFS:
+        raise RuntimeError('Missing dump.erofs. Install it or make it available in PATH / Android SDK.')
     result = subprocess.run([DUMP_EROFS, '--cat', '--path=' + path, str(image)],
                             check=True, capture_output=True)
     if not result.stdout:
@@ -32,6 +40,8 @@ def erofs(image, path):
 
 
 def debugfs(image, command, write=False):
+    if not DEBUGFS:
+        raise RuntimeError('Missing debugfs. Install it or make it available in PATH / Android SDK.')
     result = subprocess.run([DEBUGFS, *(['-w'] if write else []), '-R', command, str(image)],
                             check=True, capture_output=True)
     with (ROOT / 'logs/image-edits.log').open('ab') as log:

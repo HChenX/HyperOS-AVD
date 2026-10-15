@@ -7,9 +7,10 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
-from common import ROOT, adb, fetch_ksu, host_check, port_free, runtime
+from common import ROOT, adb, emulator_binary, emulator_env, fetch_ksu, host_check, port_free, runtime
 from setup import configure
 
 VULKAN_BASE_FEATURES = 'VulkanBatchedDescriptorSetUpdate'
@@ -142,9 +143,14 @@ def optional_patch(outcomes, feature, install, *arguments, **options):
     return result
 
 
-def initialize(config, bypass_oobe=False, rotate_window=True):
+def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save_snapshot=False):
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
+        if process and process.poll() is not None:
+            raise RuntimeError(
+                f"Emulator process exited prematurely with code {process.returncode}. "
+                "Inspect logs/emulator-current.log for details."
+            )
         try:
             result = adb(config, 'shell', 'id', capture_output=True,
                          text=True, timeout=10)
@@ -157,30 +163,121 @@ def initialize(config, bypass_oobe=False, rotate_window=True):
         raise RuntimeError('ADB did not become ready within 5 minutes. Inspect logs/emulator-current.log.')
     if is_os4():
         from os4_defaults import apply_sensor_defaults
-        apply_sensor_defaults(config)
-    root = adb(config, 'shell', "su -W -c 'id'", capture_output=True, text=True, timeout=15)
+        try:
+            apply_sensor_defaults(config)
+        except Exception as error:
+            # Sensor setup is optional for boot; a slow cross-architecture getprop
+            # must not prevent the watchdog stop and KernelSU initialization below.
+            print(f'Warning: sensor defaults were not applied: {error}', flush=True)
+    timeout_scale = 3 if sys.platform == 'win32' else 1
+    root = adb(config, 'shell', "su -W -c 'id'", capture_output=True, text=True, timeout=15 * timeout_scale)
     if 'uid=0(' not in root.stdout:
         binary = ROOT / 'tools/ksud-aarch64-linux-android'
         remote = '/data/local/tmp/hyperos-avd-ksud'
-        adb(config, 'push', str(binary), remote, check=True, capture_output=True, timeout=30)
-        adb(config, 'shell', f'chmod 755 {remote}', check=True, timeout=15)
+        adb(config, 'push', str(binary), remote, check=True, capture_output=True, timeout=30 * timeout_scale)
+        adb(config, 'shell', f'chmod 755 {remote}', check=True, timeout=15 * timeout_scale)
         result = adb(config, 'shell', remote + ' debug su', input=remote + ' install\nexit\n',
-                     text=True, capture_output=True, timeout=30)
+                     text=True, capture_output=True, timeout=30 * timeout_scale)
         if result.returncode:
             raise RuntimeError('KernelSU initialization failed: ' + result.stderr)
-    result = adb(config, 'shell', "su -W -c 'id; getenforce; /data/adb/ksud feature set selinux_hide 0; /data/adb/ksud feature save'",
-                 capture_output=True, text=True, timeout=20)
-    if 'uid=0(' not in result.stdout or 'Enforcing' not in result.stdout or result.returncode:
-        raise RuntimeError('KernelSU root/enforcing validation failed: ' + result.stdout + result.stderr)
-    deadline = time.monotonic() + 300
-    while time.monotonic() < deadline:
-        completed = adb(config, 'shell', 'getprop sys.boot_completed', capture_output=True,
-                        text=True, timeout=15)
-        if completed.returncode == 0 and completed.stdout.strip() == '1':
-            break
+
+    result = None
+    for attempt in range(5 if sys.platform == 'win32' else 1):
+        try:
+            result = adb(config, 'shell', "su -W -c 'id; getenforce; /data/adb/ksud feature set selinux_hide 0; /data/adb/ksud feature save'",
+                         capture_output=True, text=True, timeout=30 * timeout_scale)
+            if 'uid=0(' in result.stdout and 'Enforcing' in result.stdout and result.returncode == 0:
+                break
+        except subprocess.TimeoutExpired:
+            pass
         time.sleep(3)
     else:
-        raise RuntimeError('Boot did not finish within 5 minutes. Inspect logs/emulator-current.log.')
+        detail = (result.stdout + result.stderr) if result else 'timeout'
+        if not result or 'uid=0(' not in result.stdout or 'Enforcing' not in result.stdout or result.returncode:
+            raise RuntimeError('KernelSU root/enforcing validation failed: ' + detail)
+
+    if sys.platform == 'win32':
+        watchdog_properties = [
+            ('ro.hw_timeout_multiplier', '20'),
+            ('persist.sys.crashOnWatchdog', '0'),
+        ]
+        for name, value in watchdog_properties:
+            command = (
+                "su -W -c 'if [ -x /data/adb/ksu/bin/resetprop ]; then "
+                "/data/adb/ksu/bin/resetprop " + name + " " + value + "; "
+                "else /data/adb/ksud resetprop " + name + " " + value + "; fi'"
+            )
+            try:
+                adb(config, 'shell', command, capture_output=True, text=True,
+                    timeout=30 * timeout_scale)
+            except subprocess.TimeoutExpired:
+                print(f'Warning: failed to set watchdog property {name}.', flush=True)
+        state = adb(config, 'shell',
+                    'getprop ro.hw_timeout_multiplier; getprop persist.sys.crashOnWatchdog',
+                    capture_output=True, text=True, timeout=15 * timeout_scale)
+        print('Watchdog configuration: ' + ' '.join(state.stdout.split()), flush=True)
+        zygote = adb(config, 'shell', 'getprop init.svc.zygote',
+                     capture_output=True, text=True, timeout=10 * timeout_scale)
+        if zygote.stdout.strip() == 'running':
+            adb(config, 'shell', "su -W -c 'setprop ctl.restart zygote'",
+                capture_output=True, timeout=15 * timeout_scale)
+            print('Restarted zygote to apply watchdog timeout multiplier.', flush=True)
+
+    # In cross-architecture software emulation, cold boot can take longer than Xiaomi's
+    # default 20-minute BootMonitor timeout. Stop the watchdog early and verify that init
+    # actually observed the request before waiting for boot completion.
+    if is_os4() and sys.platform == 'win32':
+        stopped = False
+        for _ in range(5):
+            try:
+                adb(config, 'shell',
+                    "su -c 'stop hypsys_system; setprop ctl.stop hypsys_system'",
+                    capture_output=True, timeout=15 * timeout_scale)
+                state = adb(config, 'shell', 'getprop init.svc.hypsys_system',
+                            capture_output=True, text=True, timeout=10 * timeout_scale)
+                if state.stdout.strip() == 'stopped':
+                    stopped = True
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+        if not stopped:
+            print('Warning: hypsys_system BootMonitor could not be stopped; '
+                  'the guest may reboot at the 20-minute boot timeout.', flush=True)
+    boot_timeout = 1800 if sys.platform == 'win32' else 300
+    deadline = time.monotonic() + boot_timeout
+    last_notice = time.monotonic()
+    while time.monotonic() < deadline:
+        if process and process.poll() is not None:
+            raise RuntimeError(
+                f"Emulator process exited prematurely with code {process.returncode}. "
+                "Inspect logs/emulator-current.log for details."
+            )
+        try:
+            completed = adb(config, 'shell', 'getprop sys.boot_completed', capture_output=True,
+                            text=True, timeout=15)
+            if completed.returncode == 0 and completed.stdout.strip() == '1':
+                break
+        except subprocess.TimeoutExpired:
+            pass
+        if time.monotonic() - last_notice >= 30:
+            elapsed = int(time.monotonic() - (deadline - boot_timeout))
+            print(f"Waiting for system boot completion ({elapsed}s elapsed)...", flush=True)
+            last_notice = time.monotonic()
+        time.sleep(3)
+    else:
+        raise RuntimeError('Boot did not finish within timeout. Inspect logs/emulator-current.log.')
+    if save_snapshot:
+        print('Saving emulator snapshot default_boot...', flush=True)
+        try:
+            result = adb(config, 'emu', 'avd', 'snapshot', 'save', 'default_boot',
+                         capture_output=True, text=True, timeout=300 * timeout_scale)
+            if result.returncode:
+                print('Warning: snapshot save failed: ' + result.stderr.strip(), flush=True)
+            else:
+                print('Snapshot saved: default_boot', flush=True)
+        except Exception as error:
+            print(f'Warning: snapshot save failed: {error}', flush=True)
     build = ROOT / 'local/build.json'
     metadata = json.loads(build.read_text()) if build.is_file() else {}
     source = metadata.get('source')
@@ -234,7 +331,29 @@ def main():
                         help='Disable the OS4 macOS sRGB window tag for this launch')
     parser.add_argument('--skip-oobe', action='store_true',
                         help='Skip Xiaomi provisioning and open the native launcher')
+    parser.add_argument('--tb-size', type=int, default=512,
+                        help='TCG translation cache size in MiB on Windows; 0 uses the QEMU default')
+    parser.add_argument('--gpu', choices=['auto', 'host', 'software', 'lavapipe', 'swiftshader', 'swangle', 'guest'],
+                        help='Override the emulator GPU backend for this launch')
+    parser.add_argument('--cores', type=int,
+                        help='Override the guest vCPU count for this launch')
+    parser.add_argument('--memory', type=int,
+                        help='Override the guest RAM size in MiB for this launch')
+    parser.add_argument('--machine', choices=['ranchu', 'virt'], default='ranchu',
+                        help='Override the QEMU machine model on Windows')
+    parser.add_argument('--cpu',
+                        help='Override the QEMU CPU model on Windows')
+    parser.add_argument('--allow-snapshot-save', action='store_true',
+                        help='Allow the emulator to save snapshots on exit')
+    parser.add_argument('--snapshot', nargs='?', const='default_boot',
+                        help='Load an emulator snapshot instead of cold booting')
     args = parser.parse_args()
+    if args.tb_size < 0 or args.tb_size > 2048:
+        parser.error('--tb-size must be between 0 and 2048 MiB')
+    if args.cores is not None and not 1 <= args.cores <= 32:
+        parser.error('--cores must be between 1 and 32')
+    if args.memory is not None and not 1024 <= args.memory <= 65536:
+        parser.error('--memory must be between 1024 and 65536 MiB')
     host_check()
     config = runtime()
     port_free(config['port'])
@@ -251,13 +370,23 @@ def main():
         log.rename(logs / ('emulator-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.log'))
     avd_config = ROOT / 'avd' / (config['name'] + '.avd') / 'config.ini'
     properties = dict(line.split('=', 1) for line in avd_config.read_text().splitlines() if '=' in line)
-    memory = str(int(properties.get('hw.ramSize', '2560')))
+    memory = str(args.memory or int(properties.get('hw.ramSize', '2560')))
     build = ROOT / 'local/build.json'
-    cores = str(int(properties.get('hw.cpu.ncore', '2')))
-    command = [str(Path(config['sdk']) / 'emulator/emulator'), '-avd', config['name'],
+    cores = str(args.cores or int(properties.get('hw.cpu.ncore', '2')))
+    accel_mode = 'on' if sys.platform == 'darwin' else 'off'
+    command = [str(emulator_binary(config['sdk'])), '-avd', config['name'],
                '-sysdir', str(ROOT / 'images'), '-port', str(config['port']),
-               '-no-snapshot-load', '-no-snapshot-save', '-accel', 'on', '-gpu', 'host',
+               '-no-snapshot-load', '-no-snapshot-save', '-accel', accel_mode, '-gpu', args.gpu or 'host',
                '-memory', memory, '-cores', cores, '-show-kernel', '-verbose']
+    if args.allow_snapshot_save:
+        command.remove('-no-snapshot-save')
+    if args.snapshot:
+        snapshot_index = command.index('-no-snapshot-load')
+        command[snapshot_index:snapshot_index + 2] = ['-snapshot', args.snapshot]
+    if args.headless or sys.platform == 'win32':
+        command += ['-no-boot-anim']
+    if sys.platform == 'win32':
+        command += ['-feature', '-WindowsHypervisorPlatform,-HVF,-KVM', '-no-nested-warnings']
     if is_os4():
         command += ['-crash-report-mode', 'never']
     if build.is_file():
@@ -269,15 +398,31 @@ def main():
         command += runtime_options(image_build)
     if args.headless:
         command += ['-no-window']
-    from host_color import environment
-    launch_environment = environment(ROOT, config['name'],
-                                     enabled=not (args.headless or args.no_host_color_fix))
+    if sys.platform == 'darwin':
+        from host_color import environment
+        launch_environment = environment(ROOT, config['name'],
+                                         enabled=not (args.headless or args.no_host_color_fix))
+    else:
+        print('[Notice] sRGB window calibration is macOS-specific; standard display rendering is active on Windows.', flush=True)
+        launch_environment = emulator_env(config['sdk'])
+        if args.gpu in ('swiftshader', 'swangle', 'software', 'lavapipe'):
+            icd_name = 'lvp_icd.json' if args.gpu == 'lavapipe' else 'vk_swiftshader_icd.json'
+            icd = Path(config['sdk']) / 'emulator/lib64/vulkan' / icd_name
+            if icd.is_file():
+                launch_environment['VK_ICD_FILENAMES'] = str(icd)
+    if sys.platform == 'win32':
+        command += ['-qemu', '-machine', 'type=' + args.machine]
+        if args.cpu:
+            command += ['-cpu', args.cpu]
+        if args.tb_size:
+            command += ['-tb-size', str(args.tb_size)]
     with log.open('wb') as output:
         process = subprocess.Popen(command, env=launch_environment, stdout=output,
                                    stderr=subprocess.STDOUT, start_new_session=True)
     print(f"Starting {config['name']} (PID {process.pid}). Log: {log}", flush=True)
     # The emulator stays running if setup fails; evidence and userdata are retained.
-    initialize(config, bypass_oobe=args.skip_oobe, rotate_window=not args.headless)
+    initialize(config, bypass_oobe=args.skip_oobe, rotate_window=not args.headless,
+               process=process, save_snapshot=args.allow_snapshot_save)
 
 
 if __name__ == '__main__':
