@@ -144,7 +144,9 @@ def optional_patch(outcomes, feature, install, *arguments, **options):
 
 
 def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save_snapshot=False):
-    deadline = time.monotonic() + 300
+    timeout_scale = 3 if sys.platform == 'win32' else 1
+    adb_timeout = 900 if sys.platform == 'win32' else 300
+    deadline = time.monotonic() + adb_timeout
     while time.monotonic() < deadline:
         if process and process.poll() is not None:
             raise RuntimeError(
@@ -153,14 +155,16 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
             )
         try:
             result = adb(config, 'shell', 'id', capture_output=True,
-                         text=True, timeout=10)
+                         text=True, timeout=30 * timeout_scale)
             if result.returncode == 0 and 'uid=' in result.stdout:
                 break
         except subprocess.TimeoutExpired:
             pass
         time.sleep(3)
     else:
-        raise RuntimeError('ADB did not become ready within 5 minutes. Inspect logs/emulator-current.log.')
+        raise RuntimeError(
+            f'ADB did not become ready within {adb_timeout // 60} minutes. '
+            'Inspect logs/emulator-current.log.')
     if is_os4():
         from os4_defaults import apply_sensor_defaults
         try:
@@ -169,7 +173,6 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
             # Sensor setup is optional for boot; a slow cross-architecture getprop
             # must not prevent the watchdog stop and KernelSU initialization below.
             print(f'Warning: sensor defaults were not applied: {error}', flush=True)
-    timeout_scale = 3 if sys.platform == 'win32' else 1
     root = adb(config, 'shell', "su -W -c 'id'", capture_output=True, text=True, timeout=15 * timeout_scale)
     if 'uid=0(' not in root.stdout:
         binary = ROOT / 'tools/ksud-aarch64-linux-android'
@@ -348,6 +351,12 @@ def main():
                         help='Skip Xiaomi provisioning and open the native launcher')
     parser.add_argument('--tb-size', type=int, default=512,
                         help='TCG translation cache size in MiB on Windows; 0 uses the QEMU default')
+    parser.add_argument('--tb-stats', action='store_true',
+                        help='Collect low-overhead TCG lookup/translation statistics for info jit')
+    parser.add_argument('--tb-hotness-file', type=Path, default=ROOT / 'local/tb-hotness.txt',
+                        help='Persistent guest-PC hotspot index path on Windows')
+    parser.add_argument('--tb-hotness-max', type=int, default=65536,
+                        help='Maximum persistent hotspot entries (1024-4194304)')
     parser.add_argument('--gpu', choices=['auto', 'host', 'software', 'lavapipe', 'swiftshader', 'swangle', 'guest'],
                         help='Override the emulator GPU backend for this launch')
     parser.add_argument('--cores', type=int,
@@ -367,6 +376,8 @@ def main():
     args = parser.parse_args()
     if args.tb_size < 0 or args.tb_size > 2048:
         parser.error('--tb-size must be between 0 and 2048 MiB')
+    if not 1024 <= args.tb_hotness_max <= 4194304:
+        parser.error('--tb-hotness-max must be between 1024 and 4194304')
     if args.cores is not None and not 1 <= args.cores <= 32:
         parser.error('--cores must be between 1 and 32')
     if args.memory is not None and not 1024 <= args.memory <= 65536:
@@ -422,6 +433,11 @@ def main():
     else:
         print('[Notice] sRGB window calibration is macOS-specific; standard display rendering is active on Windows.', flush=True)
         launch_environment = emulator_env(config['sdk'])
+        args.tb_hotness_file.parent.mkdir(parents=True, exist_ok=True)
+        launch_environment['QEMU_TB_HOTNESS_FILE'] = str(args.tb_hotness_file)
+        launch_environment['QEMU_TB_HOTNESS_MAX'] = str(args.tb_hotness_max)
+        if args.tb_stats:
+            launch_environment['QEMU_TB_STATS'] = '1'
         if args.gpu in ('swiftshader', 'swangle', 'software', 'lavapipe'):
             icd_name = 'lvp_icd.json' if args.gpu == 'lavapipe' else 'vk_swiftshader_icd.json'
             icd = Path(config['sdk']) / 'emulator/lib64/vulkan' / icd_name
