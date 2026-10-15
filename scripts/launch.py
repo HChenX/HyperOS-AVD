@@ -291,14 +291,19 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
         if rotate_window:
             align_window(config)
     if is_os4():
-        migrate_boot_service_helpers(config)
-        # Both OS4 variants install the same two module artifacts. Guest
-        # services select individual recipes by content and capability.
-        from apply_native_compat import install as install_native_compat
-        from core_context import load as load_core_context
-        outcomes['core'] = install_native_compat(config, platform_context=load_core_context(ROOT))
-        from apply_app_compat import install_prebuilt as install_apps
-        outcomes['apps'] = install_apps(config, workspace=ROOT)
+        try:
+            migrate_boot_service_helpers(config)
+            # Both OS4 variants install the same two module artifacts. Guest
+            # services select individual recipes by content and capability.
+            from apply_native_compat import install as install_native_compat
+            from core_context import load as load_core_context
+            outcomes['core'] = install_native_compat(config, platform_context=load_core_context(ROOT))
+            from apply_app_compat import install_prebuilt as install_apps
+            outcomes['apps'] = install_apps(config, workspace=ROOT)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            reason = str(error).splitlines()[0][:240] if str(error) else type(error).__name__
+            print('Warning: post-boot compatibility setup deferred: ' + reason, flush=True)
+            outcomes['post_boot'] = {'state': 'deferred', 'error': reason}
     if bypass_oobe:
         skip_oobe(config)
     manager = adb(config, 'shell', 'pm path me.weishu.kernelsu', capture_output=True, text=True, timeout=15)
