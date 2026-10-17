@@ -77,6 +77,8 @@ def emulator_env(sdk=None, base_env=None):
         env['PATH'] = ';'.join(extra_paths) + (';' + existing if existing else '')
         env['QT_QPA_PLATFORM_PLUGIN_PATH'] = str(sdk_emu / 'lib64/qt/plugins')
         env['QT_PLUGIN_PATH'] = str(sdk_emu / 'lib64/qt/plugins')
+    env.setdefault('ANDROID_EMU_NO_HANG_DETECTOR', '1')
+    env.setdefault('ANDROID_EMU_DISABLE_CRASHHANDLER', '1')
     return env
 
 

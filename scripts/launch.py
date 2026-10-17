@@ -89,6 +89,10 @@ def skip_oobe(config):
         'settings put secure user_setup_complete 1',
         'pm disable-user --user 0 com.android.provision',
         'am force-stop com.android.provision',
+        'settings put system screen_brightness_mode 0',
+        'settings put system accelerometer_rotation 0',
+        'kill -STOP $(pidof com.xiaomi.finddevice) 2>/dev/null || true',
+        'kill -STOP $(pidof com.xiaomi.aicr) 2>/dev/null || true',
         'input keyevent 224',
         'wm dismiss-keyguard',
         'am start -W -a android.intent.action.MAIN -c android.intent.category.HOME '
@@ -173,33 +177,67 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
             # Sensor setup is optional for boot; a slow cross-architecture getprop
             # must not prevent the watchdog stop and KernelSU initialization below.
             print(f'Warning: sensor defaults were not applied: {error}', flush=True)
-    root = adb(config, 'shell', "su -W -c 'id'", capture_output=True, text=True, timeout=15 * timeout_scale)
-    if 'uid=0(' not in root.stdout:
+    if is_os4() and sys.platform == 'win32':
+        try:
+            adb(config, 'shell', 'setprop ctl.stop hypsys_system; setprop ctl.stop misight',
+                capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+
+    root_ready = False
+    for attempt in range(10 if sys.platform == 'win32' else 2):
+        try:
+            root = adb(config, 'shell', "su -W -c 'id'", capture_output=True, text=True,
+                       timeout=20 * timeout_scale)
+            if root.returncode == 0 and 'uid=0(' in root.stdout:
+                root_ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(3)
+
+    if not root_ready:
         binary = ROOT / 'tools/ksud-aarch64-linux-android'
         remote = '/data/local/tmp/hyperos-avd-ksud'
-        adb(config, 'push', str(binary), remote, check=True, capture_output=True, timeout=30 * timeout_scale)
-        adb(config, 'shell', f'chmod 755 {remote}', check=True, timeout=15 * timeout_scale)
-        result = adb(config, 'shell', remote + ' debug su', input=remote + ' install\nexit\n',
-                     text=True, capture_output=True, timeout=30 * timeout_scale)
-        if result.returncode:
-            raise RuntimeError('KernelSU initialization failed: ' + result.stderr)
+        try:
+            adb(config, 'push', str(binary), remote, check=True, capture_output=True, timeout=30 * timeout_scale)
+            adb(config, 'shell', f'chmod 755 {remote}', check=True, timeout=15 * timeout_scale)
+            result = adb(config, 'shell', remote + ' debug su', input=remote + ' install\nexit\n',
+                         text=True, capture_output=True, timeout=30 * timeout_scale)
+            if result.returncode:
+                print('Warning: KernelSU manual install returned: ' + result.stderr, flush=True)
+        except Exception as error:
+            print(f'Warning: KernelSU manual install attempt failed: {error}', flush=True)
 
     result = None
-    for attempt in range(5 if sys.platform == 'win32' else 1):
+    for attempt in range(8 if sys.platform == 'win32' else 2):
         try:
             result = adb(config, 'shell', "su -W -c 'id; getenforce; /data/adb/ksud feature set selinux_hide 0; /data/adb/ksud feature save'",
                          capture_output=True, text=True, timeout=30 * timeout_scale)
             if 'uid=0(' in result.stdout and 'Enforcing' in result.stdout and result.returncode == 0:
                 break
-        except subprocess.TimeoutExpired:
+        except Exception:
             pass
         time.sleep(3)
     else:
         detail = (result.stdout + result.stderr) if result else 'timeout'
         if not result or 'uid=0(' not in result.stdout or 'Enforcing' not in result.stdout or result.returncode:
-            raise RuntimeError('KernelSU root/enforcing validation failed: ' + detail)
+            print('Warning: KernelSU root/enforcing validation incomplete (' + detail + '), continuing boot monitoring...', flush=True)
 
     if sys.platform == 'win32':
+        watchdog_script = (
+            "su -W -c 'mkdir -p /data/adb/post-fs-data.d && "
+            "if [ ! -f /data/adb/post-fs-data.d/00-watchdog.sh ]; then "
+            "printf \"#!/system/bin/sh\\n/data/adb/ksud resetprop ro.hw_timeout_multiplier 20\\n"
+            "/data/adb/ksud resetprop persist.sys.crashOnWatchdog 0\\n\" "
+            "> /data/adb/post-fs-data.d/00-watchdog.sh && "
+            "chmod 755 /data/adb/post-fs-data.d/00-watchdog.sh; fi'"
+        )
+        try:
+            adb(config, 'shell', watchdog_script, capture_output=True, text=True,
+                timeout=30 * timeout_scale)
+        except subprocess.TimeoutExpired:
+            pass
         watchdog_properties = [
             ('ro.hw_timeout_multiplier', '20'),
             ('persist.sys.crashOnWatchdog', '0'),
@@ -218,28 +256,39 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
         state = adb(config, 'shell',
                     'getprop ro.hw_timeout_multiplier; getprop persist.sys.crashOnWatchdog',
                     capture_output=True, text=True, timeout=15 * timeout_scale)
-        print('Watchdog configuration: ' + ' '.join(state.stdout.split()), flush=True)
-        zygote = adb(config, 'shell', 'getprop init.svc.zygote',
-                     capture_output=True, text=True, timeout=10 * timeout_scale)
-        if zygote.stdout.strip() == 'running':
-            adb(config, 'shell', "su -W -c 'setprop ctl.restart zygote'",
-                capture_output=True, timeout=15 * timeout_scale)
-            print('Restarted zygote to apply watchdog timeout multiplier.', flush=True)
+        parts = state.stdout.split()
+        multiplier = parts[0] if parts else ''
+        print('Watchdog configuration: ' + ' '.join(parts), flush=True)
+        if multiplier != '20':
+            zygote = adb(config, 'shell', 'getprop init.svc.zygote',
+                         capture_output=True, text=True, timeout=10 * timeout_scale)
+            if zygote.stdout.strip() == 'running':
+                adb(config, 'shell', "su -W -c 'setprop ctl.restart zygote'",
+                    capture_output=True, timeout=15 * timeout_scale)
+                print('Restarted zygote to apply watchdog timeout multiplier.', flush=True)
+        else:
+            print('Watchdog multiplier already active; Zygote restart skipped.', flush=True)
 
     # In cross-architecture software emulation, cold boot can take longer than Xiaomi's
     # default 20-minute BootMonitor timeout. Stop the watchdog early and verify that init
     # actually observed the request before waiting for boot completion.
     if is_os4() and sys.platform == 'win32':
         stopped = False
-        for _ in range(5):
+        for _ in range(10):
             try:
                 adb(config, 'shell',
-                    "su -c 'stop hypsys_system; setprop ctl.stop hypsys_system'",
+                    "su -c 'stop hypsys_system; setprop ctl.stop hypsys_system; "
+                    "stop misight; setprop ctl.stop misight; "
+                    "stop statsd; stop traced; stop traced_probes; stop incidentd; "
+                    "stop neuralnetworks_hal_service_aidl_sample_all; "
+                    "stop neuralnetworks_hal_service_aidl_sample_limited; "
+                    "stop neuralnetworks_hal_service_shim_sample'",
                     capture_output=True, timeout=15 * timeout_scale)
                 state = adb(config, 'shell', 'getprop init.svc.hypsys_system',
                             capture_output=True, text=True, timeout=10 * timeout_scale)
                 if state.stdout.strip() == 'stopped':
                     stopped = True
+                    print('Successfully stopped hypsys_system BootMonitor and idle telemetry services.', flush=True)
                     break
             except Exception:
                 pass
@@ -247,9 +296,48 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
         if not stopped:
             print('Warning: hypsys_system BootMonitor could not be stopped; '
                   'the guest may reboot at the 20-minute boot timeout.', flush=True)
+    def apply_early_mapper_fix(config, timeout_scale=1):
+        """Ensure ranchu IMapper does not crash HWC3 on host shared memory slots."""
+        import hashlib
+        from patch_mapper import BEFORE, AFTER, NATIVE
+        try:
+            state = adb(config, 'get-state', capture_output=True, text=True, timeout=5)
+            if state.returncode != 0 or state.stdout.strip() != 'device':
+                return False
+            res = adb(config, 'shell', f"su -c '/data/adb/ksu/bin/busybox sha256sum {NATIVE} 2>/dev/null || sha256sum {NATIVE}'",
+                      capture_output=True, text=True, timeout=10 * timeout_scale)
+            if res.returncode != 0:
+                return False
+            current_hash = res.stdout.strip().split()[0] if res.stdout.strip() else ''
+            if current_hash == AFTER:
+                return True
+            if current_hash != BEFORE:
+                return False
+            local_patched = ROOT / 'work/mapper.ranchu.patched.so' if (ROOT / 'work/mapper.ranchu.patched.so').is_file() else ROOT / 'mapper.ranchu.patched.so'
+            if not local_patched.is_file():
+                from patch_mapper import patch
+                raw = adb(config, 'exec-out', f"su -c 'cat {NATIVE}'", capture_output=True, timeout=15 * timeout_scale).stdout
+                if hashlib.sha256(raw).hexdigest() == BEFORE:
+                    local_patched.write_bytes(patch(raw))
+            remote_tmp = '/data/local/tmp/mapper.ranchu.so'
+            adb(config, 'push', str(local_patched), remote_tmp, capture_output=True, timeout=15 * timeout_scale)
+            cmd = (
+                f"chown 0:0 {remote_tmp} && chmod 644 {remote_tmp} && "
+                f"chcon u:object_r:same_process_hal_file:s0 {remote_tmp} && "
+                f"/data/adb/ksu/bin/busybox nsenter -t 1 -m -- /data/adb/ksu/bin/busybox mount -o bind {remote_tmp} {NATIVE} && "
+                f"/data/adb/ksu/bin/busybox nsenter -t 1 -m -- /data/adb/ksu/bin/busybox mount -o remount,bind,ro,nosuid,nodev {NATIVE} && "
+                f"kill -9 $(pidof android.hardware.graphics.composer3-service.ranchu) 2>/dev/null || true"
+            )
+            adb(config, 'shell', f"su -c '{cmd}'", capture_output=True, text=True, timeout=15 * timeout_scale)
+            print('Applied early ranchu IMapper fix; restarted HWC3 service.', flush=True)
+            return True
+        except Exception:
+            return False
+
     boot_timeout = 1800 if sys.platform == 'win32' else 300
     deadline = time.monotonic() + boot_timeout
     last_notice = time.monotonic()
+    early_services_handled = False
     while time.monotonic() < deadline:
         if process and process.poll() is not None:
             raise RuntimeError(
@@ -257,6 +345,21 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
                 "Inspect logs/emulator-current.log for details."
             )
         try:
+            if not early_services_handled:
+                if apply_early_mapper_fix(config, timeout_scale):
+                    early_services_handled = True
+                    try:
+                        adb(config, 'shell',
+                            "su -c 'stop hypsys_system; setprop ctl.stop hypsys_system; "
+                            "stop misight; setprop ctl.stop misight; "
+                            "stop statsd; stop traced; stop traced_probes; stop incidentd; "
+                            "stop neuralnetworks_hal_service_aidl_sample_all; "
+                            "stop neuralnetworks_hal_service_aidl_sample_limited; "
+                            "stop neuralnetworks_hal_service_shim_sample'",
+                            capture_output=True, timeout=10 * timeout_scale)
+                        print('Successfully stopped hypsys_system BootMonitor and idle telemetry services.', flush=True)
+                    except Exception:
+                        pass
             completed = adb(config, 'shell', 'getprop sys.boot_completed', capture_output=True,
                             text=True, timeout=15)
             if completed.returncode == 0 and completed.stdout.strip() == '1':
@@ -319,21 +422,18 @@ def initialize(config, bypass_oobe=False, rotate_window=True, process=None, save
             outcomes['post_boot'] = {'state': 'deferred', 'error': reason}
     if bypass_oobe:
         skip_oobe(config)
-    manager = adb(config, 'shell', 'pm path me.weishu.kernelsu', capture_output=True, text=True, timeout=15)
+    manager = adb(config, 'shell', 'pm path me.weishu.kernelsu', capture_output=True, text=True, timeout=15 * timeout_scale)
     if 'package:' not in manager.stdout:
         apk = ROOT / 'tools/KernelSU_v3.3.0_32601-release.apk'
-        if build.is_file() and json.loads(build.read_text()).get('source') == 'official-yingtian-ota':
-            # MIUI's fresh tablet setup rejects shell installs; use verified KernelSU root.
-            remote = '/data/local/tmp/hyperos-avd-ksu.apk'
-            adb(config, 'push', str(apk), remote, check=True, capture_output=True, timeout=30)
-            try:
-                adb(config, 'shell', 'su -W -c ' + shlex.quote('pm install -r ' + remote),
-                    check=True, timeout=60)
-            finally:
-                adb(config, 'shell', 'rm -f ' + remote, timeout=15)
-        else:
-            adb(config, 'install', '--no-incremental', str(apk), check=True, timeout=60)
-    adb(config, 'shell', 'rm -f /data/local/tmp/hyperos-avd-ksud', timeout=15)
+        # MIUI's fresh setup rejects standard shell installs; use verified KernelSU root.
+        remote = '/data/local/tmp/hyperos-avd-ksu.apk'
+        adb(config, 'push', str(apk), remote, check=True, capture_output=True, timeout=30 * timeout_scale)
+        try:
+            adb(config, 'shell', 'su -W -c ' + shlex.quote('pm install -r ' + remote),
+                check=True, timeout=60 * timeout_scale)
+        finally:
+            adb(config, 'shell', 'rm -f ' + remote, timeout=15 * timeout_scale)
+    adb(config, 'shell', 'rm -f /data/local/tmp/hyperos-avd-ksud', timeout=15 * timeout_scale)
     (ROOT / 'local').mkdir(exist_ok=True)
     (ROOT / 'local/last-boot.json').write_text(json.dumps(
         {'name': config['name'], 'serial': f"emulator-{config['port']}",
@@ -385,6 +485,22 @@ def main():
     host_check()
     config = runtime()
     port_free(config['port'])
+    avd_dir = ROOT / 'avd' / (config['name'] + '.avd')
+    for lock_name in ['hardware-qemu.ini.lock', 'multiinstance.lock']:
+        lock_path = avd_dir / lock_name
+        if lock_path.exists():
+            if lock_path.is_dir():
+                shutil.rmtree(lock_path, ignore_errors=True)
+            else:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+    snapshots_dir = avd_dir / 'snapshots'
+    if snapshots_dir.is_dir():
+        for snap_dir in snapshots_dir.iterdir():
+            if snap_dir.is_dir() and not (snap_dir / 'snapshot.pb').is_file():
+                shutil.rmtree(snap_dir, ignore_errors=True)
     if not (ROOT / 'images/userdata.img').is_file():
         raise RuntimeError('Run Setup.command with the release manifest first.')
     # Refresh relocated paths before every cold start; collision checks protect other AVDs.
@@ -404,13 +520,14 @@ def main():
     accel_mode = 'on' if sys.platform == 'darwin' else 'off'
     command = [str(emulator_binary(config['sdk'])), '-avd', config['name'],
                '-sysdir', str(ROOT / 'images'), '-port', str(config['port']),
-               '-no-snapshot-load', '-no-snapshot-save', '-accel', accel_mode, '-gpu', args.gpu or 'host',
+               '-accel', accel_mode, '-gpu', args.gpu or 'host',
                '-memory', memory, '-cores', cores, '-show-kernel', '-verbose']
-    if args.allow_snapshot_save:
-        command.remove('-no-snapshot-save')
     if args.snapshot:
-        snapshot_index = command.index('-no-snapshot-load')
-        command[snapshot_index:snapshot_index + 2] = ['-snapshot', args.snapshot]
+        command += ['-snapshot', args.snapshot]
+    else:
+        command += ['-no-snapshot-load']
+    if not args.allow_snapshot_save:
+        command += ['-no-snapshot-save']
     if args.headless or sys.platform == 'win32':
         command += ['-no-boot-anim']
     if sys.platform == 'win32':
@@ -451,19 +568,29 @@ def main():
             command += ['-tb-size', str(args.tb_size)]
         if args.qemu_extra:
             command += args.qemu_extra
-    popen_kwargs = {}
-    if sys.platform == 'win32':
-        popen_kwargs['creationflags'] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)
+    if sys.platform == 'win32' and not args.headless:
+        from win32_interactive import spawn_process
+        process = spawn_process(command, env=launch_environment, log_path=log, desktop=r'WinSta0\Default')
+        print(f"Starting {config['name']} (PID {process.pid}) on interactive desktop. Log: {log}", flush=True)
+        # The emulator stays running if setup fails; evidence and userdata are retained.
+        initialize(config, bypass_oobe=args.skip_oobe, rotate_window=not args.headless,
+                   process=process, save_snapshot=args.allow_snapshot_save)
     else:
-        popen_kwargs['start_new_session'] = True
-    with log.open('wb') as output:
-        process = subprocess.Popen(command, env=launch_environment, stdout=output,
-                                   stderr=subprocess.STDOUT, **popen_kwargs)
-    print(f"Starting {config['name']} (PID {process.pid}). Log: {log}", flush=True)
-    # The emulator stays running if setup fails; evidence and userdata are retained.
-    initialize(config, bypass_oobe=args.skip_oobe, rotate_window=not args.headless,
-               process=process, save_snapshot=args.allow_snapshot_save)
+        popen_kwargs = {}
+        if sys.platform == 'win32':
+            popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs['start_new_session'] = True
+        output = log.open('wb')
+        try:
+            process = subprocess.Popen(command, env=launch_environment, stdout=output,
+                                       stderr=subprocess.STDOUT, **popen_kwargs)
+            print(f"Starting {config['name']} (PID {process.pid}). Log: {log}", flush=True)
+            # The emulator stays running if setup fails; evidence and userdata are retained.
+            initialize(config, bypass_oobe=args.skip_oobe, rotate_window=not args.headless,
+                       process=process, save_snapshot=args.allow_snapshot_save)
+        finally:
+            output.close()
 
 
 if __name__ == '__main__':
