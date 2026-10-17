@@ -12,7 +12,7 @@ import re
 
 
 FEATURES = frozenset(('flutter', 'hwui', 'assistant', 'lockscreen-video',
-                      'navigation', 'composer', 'rear-display'))
+                      'navigation', 'composer', 'rear-display', 'mapper'))
 APP_PACKAGES = frozenset(('com.miui.home', 'com.miui.weather2',
                           'com.miui.voiceassist', 'com.miui.aod'))
 SLUG = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*\Z')
@@ -138,6 +138,7 @@ def catalog():
     import patch_composer as composer
     import patch_flutter as flutter
     import patch_lockscreen_video as lockscreen
+    import patch_mapper as mapper
     import patch_pad_hwui as hwui
     import patch_rear_display as rear
 
@@ -157,12 +158,14 @@ def catalog():
         _profile('navigation-route-watchdog', 'navigation', navigation.WATCHDOG_BEFORE,
                  navigation.WATCHDOG_AFTER, navigation.WATCHDOG_SITES),
         _profile('composer-plane-alpha', 'composer', composer.BEFORE, composer.AFTER, composer.SITES),
+        _profile('composer-mapper-shared-slots', 'mapper', mapper.BEFORE, mapper.AFTER, mapper.SITES),
         _profile('rear-display-secondary-timing', 'rear-display', rear.BEFORE, rear.AFTER, rear.SITES),
     ))
     targets = [
         _target('flutter', 'early', flutter_targets.SYSTEM_LIB),
         _target('hwui', 'early', hwui.NATIVE),
         _target('composer', 'early', composer.NATIVE),
+        _target('mapper', 'early', mapper.NATIVE),
         _target('rear-display', 'early', rear.NATIVE),
         *[_target('flutter', 'late', package=package,
                   library=PurePosixPath(flutter_targets.SYSTEM_LIB).name)

@@ -50,8 +50,8 @@ class NativePatchCatalogTests(unittest.TestCase):
         self.assertEqual(data, native.dump_catalog())
         self.assertEqual(json.loads(data), self.value)
         self.assertEqual(native.validate_catalog(self.value), self.value)
-        self.assertEqual(len(self.value['profiles']), 13)
-        self.assertEqual(len(self.value['targets']), 10)
+        self.assertEqual(len(self.value['profiles']), 14)
+        self.assertEqual(len(self.value['targets']), 11)
         self.assertEqual(set(row['feature'] for row in self.value['profiles']), native.FEATURES)
         self.assertEqual([row['id'] for row in self.value['profiles']],
                          sorted(row['id'] for row in self.value['profiles']))
@@ -72,6 +72,7 @@ class NativePatchCatalogTests(unittest.TestCase):
         import patch_assistant as assistant
         import patch_composer as composer
         import patch_lockscreen_video as lockscreen
+        import patch_mapper as mapper
         import patch_pad_hwui as hwui
         import patch_rear_display as rear
         rows = {row['before']: row for row in self.value['profiles']}
@@ -81,6 +82,7 @@ class NativePatchCatalogTests(unittest.TestCase):
                                                     hwui.REPLACEMENT.hex()]])
         for before, after, sites in ((assistant.BEFORE, assistant.AFTER, assistant.SITES),
                                      (composer.BEFORE, composer.AFTER, composer.SITES),
+                                     (mapper.BEFORE, mapper.AFTER, mapper.SITES),
                                      (rear.BEFORE, rear.AFTER, rear.SITES),
                                      (lockscreen.BEFORE, lockscreen.AFTER, lockscreen.SITES),
                                      (navigation.AOT_BEFORE, navigation.AOT_AFTER, navigation.AOT_SITES),
@@ -105,10 +107,11 @@ class NativePatchCatalogTests(unittest.TestCase):
 
     def test_system_and_app_targets_are_explicit_and_scoped(self):
         system = {row['feature']: row for row in self.value['targets'] if row['kind'] == 'system'}
-        self.assertEqual(set(system), {'flutter', 'hwui', 'composer', 'rear-display'})
+        self.assertEqual(set(system), {'flutter', 'hwui', 'composer', 'rear-display', 'mapper'})
         self.assertTrue(all(row['phase'] == 'early' and not row['package'] for row in system.values()))
         self.assertEqual(system['flutter']['path'], '/system_ext/lib64/libhyper_os_flutter.so')
         self.assertEqual(system['hwui']['path'], '/system/lib64/libhwui.so')
+        self.assertEqual(system['mapper']['path'], '/vendor/lib64/hw/mapper.ranchu.so')
         apps = [row for row in self.value['targets'] if row['kind'] == 'app']
         self.assertEqual(set(row['package'] for row in apps), native.APP_PACKAGES)
         self.assertTrue(all(row['phase'] == 'late' and row['path'] == '' for row in apps))
